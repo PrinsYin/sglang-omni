@@ -35,6 +35,32 @@ def _operator_selected_prefill_graph_backend(
     return isinstance(prefill_config, Mapping) and "backend" in prefill_config
 
 
+def _resolve_model_default_breakable_prefill_graph(
+    server_args: Any,
+    *,
+    supports_breakable_prefill_cuda_graph: bool,
+) -> None:
+    """Run SGLang's compatibility gates for an Omni model default.
+
+    SGLang treats every non-default prefill backend as an operator-locked
+    choice and therefore skips its compatibility cascade.  Omni model
+    defaults are not operator overrides: remove that lock, attest an adopted
+    multimodal model through the existing capability bit, and replay the
+    upstream compatibility and disaggregation-role gates.
+    """
+    server_args._cuda_graph_config_locked.discard(("prefill", "backend"))
+
+    model_config = server_args.get_model_config()
+    if (
+        supports_breakable_prefill_cuda_graph
+        and getattr(model_config, "is_multimodal", False)
+    ):
+        model_config.is_multimodal_breakable_cuda_graph_supported = True
+
+    server_args._apply_cuda_graph_compatibility()
+    server_args._apply_cuda_graph_disaggregation_roles()
+
+
 class SGLangGenerationEngineBuilder(ABC):
     """Build the model-neutral parts of a SGLang AR engine stage.
 
@@ -89,21 +115,23 @@ class SGLangGenerationEngineBuilder(ABC):
             **overrides,
         )
         self.customize_server_args(server_args)
+        prefill_graph_backend = get_prefill_cuda_graph_backend(server_args)
+        if (
+            prefill_graph_backend == CudaGraphBackend.BREAKABLE
+            and not operator_selected_prefill_backend
+        ):
+            _resolve_model_default_breakable_prefill_graph(
+                server_args,
+                supports_breakable_prefill_cuda_graph=(
+                    self.supports_breakable_prefill_cuda_graph
+                ),
+            )
         self.validate_before_infrastructure(server_args)
 
         infra_kwargs = dict(self.infra_kwargs())
         if self.model_arch_override is not None:
             infra_kwargs.setdefault("model_arch_override", self.model_arch_override)
         prefill_graph_backend = get_prefill_cuda_graph_backend(server_args)
-        if (
-            prefill_graph_backend != CudaGraphBackend.DISABLED
-            and not operator_selected_prefill_backend
-        ):
-            # SGLang treats every non-default source as operator-locked. A
-            # model-qualified stage default should survive compatibility
-            # resolution, but must remain eligible for the late free-memory
-            # safety gate immediately before graph capture.
-            server_args._cuda_graph_config_locked.discard(("prefill", "backend"))
         if prefill_graph_backend == CudaGraphBackend.BREAKABLE:
             if not self.supports_breakable_prefill_cuda_graph:
                 raise RuntimeError(

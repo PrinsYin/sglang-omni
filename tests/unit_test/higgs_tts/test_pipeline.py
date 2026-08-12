@@ -249,6 +249,7 @@ def _install_higgs_engine_build_fakes(monkeypatch) -> dict[str, object]:
         "infrastructure_saw_graph_disabled": [],
         "init_graph_calls": [],
         "attest_calls": [],
+        "compatibility_calls": [],
     }
 
     def fake_build_sglang_server_args(checkpoint_dir, context_length, **overrides):
@@ -282,6 +283,17 @@ def _install_higgs_engine_build_fakes(monkeypatch) -> dict[str, object]:
             _cuda_graph_config_locked=locked,
             torch_compile_max_bs=32,
         )
+        model_config = SimpleNamespace(
+            is_multimodal=True,
+            is_multimodal_breakable_cuda_graph_supported=False,
+        )
+        server_args.get_model_config = lambda: model_config
+        server_args._apply_cuda_graph_compatibility = lambda: records[
+            "compatibility_calls"
+        ].append("compatibility")
+        server_args._apply_cuda_graph_disaggregation_roles = lambda: records[
+            "compatibility_calls"
+        ].append("disaggregation_roles")
         captured["checkpoint_dir"] = checkpoint_dir
         captured["context_length"] = context_length
         captured["overrides"] = overrides
@@ -410,6 +422,13 @@ def test_higgs_tts_engine_default_enables_breakable_prefill_graphs(
     assert ("prefill", "backend") not in captured[
         "server_args"
     ]._cuda_graph_config_locked
+    assert captured[
+        "server_args"
+    ].get_model_config().is_multimodal_breakable_cuda_graph_supported is True
+    assert records["compatibility_calls"] == [
+        "compatibility",
+        "disaggregation_roles",
+    ]
     assert captured["infra_kwargs"]["enable_prefill_input_embeds"] is True
     assert len(records["attest_calls"]) == 1
     assert captured["server_args"].disable_overlap_schedule is True

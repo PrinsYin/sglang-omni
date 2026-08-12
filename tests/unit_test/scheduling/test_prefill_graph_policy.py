@@ -301,6 +301,8 @@ def test_builder_wires_payload_slot_and_attestation(monkeypatch) -> None:
     infra_kwargs_seen: list[dict[str, Any]] = []
     attest_calls: list[tuple[Any, Any]] = []
     backend_locks_seen: list[bool] = []
+    compatibility_calls: list[str] = []
+    multimodal_breakable_support_seen: list[bool] = []
 
     def fake_build_sglang_server_args(checkpoint_dir, *, context_length, **overrides):
         del checkpoint_dir, context_length
@@ -309,18 +311,33 @@ def test_builder_wires_payload_slot_and_attestation(monkeypatch) -> None:
         locked = set(_PREFILL_BS_LOCKED if prefill_bs else ())
         if "cuda_graph_backend_prefill" in overrides:
             locked.add(("prefill", "backend"))
-        return _server_args(
+        server_args = _server_args(
             prefill_backend=prefill_backend,
             prefill_bs=prefill_bs,
             prefill_max_bs=overrides.get("cuda_graph_max_bs_prefill"),
             locked=locked,
         )
+        model_config = SimpleNamespace(
+            is_multimodal=True,
+            is_multimodal_breakable_cuda_graph_supported=False,
+        )
+        server_args.get_model_config = lambda: model_config
+        server_args._apply_cuda_graph_compatibility = lambda: (
+            compatibility_calls.append("compatibility")
+        )
+        server_args._apply_cuda_graph_disaggregation_roles = lambda: (
+            compatibility_calls.append("disaggregation_roles")
+        )
+        return server_args
 
     def fake_create_sglang_infrastructure(server_args, gpu_id, **kwargs):
         del gpu_id
         infra_kwargs_seen.append(dict(kwargs))
         backend_locks_seen.append(
             ("prefill", "backend") in server_args._cuda_graph_config_locked
+        )
+        multimodal_breakable_support_seen.append(
+            server_args.get_model_config().is_multimodal_breakable_cuda_graph_supported
         )
         model_runner = SimpleNamespace(
             model=SimpleNamespace(),
@@ -368,7 +385,11 @@ def test_builder_wires_payload_slot_and_attestation(monkeypatch) -> None:
 
         def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
             del dtype
-            return {"max_running_requests": 4}
+            return {
+                "max_running_requests": 4,
+                "cuda_graph_backend_prefill": "breakable",
+                "cuda_graph_bs_prefill": [128, 256],
+            }
 
         def setup_model(self, **kwargs: Any) -> None:
             del kwargs
@@ -394,13 +415,17 @@ def test_builder_wires_payload_slot_and_attestation(monkeypatch) -> None:
 
     assert infra_kwargs_seen[-1]["enable_prefill_input_embeds"] is True
     assert backend_locks_seen[-1] is True
+    assert multimodal_breakable_support_seen[-1] is False
+    assert compatibility_calls == []
     assert len(attest_calls) == 1
 
     PolicyBuilder().build("model")
 
-    assert "enable_prefill_input_embeds" not in infra_kwargs_seen[-1]
+    assert infra_kwargs_seen[-1]["enable_prefill_input_embeds"] is True
     assert backend_locks_seen[-1] is False
-    assert len(attest_calls) == 1
+    assert multimodal_breakable_support_seen[-1] is True
+    assert compatibility_calls == ["compatibility", "disaggregation_roles"]
+    assert len(attest_calls) == 2
 
 
 def test_builder_rejects_breakable_without_model_opt_in(monkeypatch) -> None:
